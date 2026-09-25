@@ -20,9 +20,11 @@ import (
 
 // Domains are unique per listener, so tests that seed the domain index have to use the
 // same composite key the validator builds.
+const testNamespace = "ns"
+
 var (
-	testListenerA = helpers.NamespacedName{Namespace: "ns", Name: "listener-a"}
-	testListenerB = helpers.NamespacedName{Namespace: "ns", Name: "listener-b"}
+	testListenerA = helpers.NamespacedName{Namespace: testNamespace, Name: "listener-a"}
+	testListenerB = helpers.NamespacedName{Namespace: testNamespace, Name: "listener-b"}
 )
 
 func ldk(listener helpers.NamespacedName, domain string) string {
@@ -39,7 +41,7 @@ func makeVS(name string, nodeIDs []string) *v1alpha1.VirtualService {
 }
 
 // helper to create Listener CR with given host:port
-func makeListenerCR(ns, name, host string, port uint32) *v1alpha1.Listener {
+func makeListenerCR(name, host string, port uint32) *v1alpha1.Listener {
 	l := &listenerv3.Listener{
 		Address: &corev3.Address{
 			Address: &corev3.Address_SocketAddress{
@@ -53,7 +55,7 @@ func makeListenerCR(ns, name, host string, port uint32) *v1alpha1.Listener {
 	b, _ := protoutil.Marshaler.Marshal(l)
 	return &v1alpha1.Listener{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "envoy.kaasops.io/v1alpha1", Kind: "Listener"},
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name},
 		Spec:       &runtime.RawExtension{Raw: b},
 	}
 }
@@ -171,8 +173,8 @@ func TestLightValidator_SameDomainDifferentListener(t *testing.T) {
 func TestLightValidator_SameDomainListenersSharingPort(t *testing.T) {
 	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
 	st := store.New()
-	st.SetListener(makeListenerCR("ns", "listener-a", "0.0.0.0", 80))
-	st.SetListener(makeListenerCR("ns", "listener-b", "10.0.0.1", 80))
+	st.SetListener(makeListenerCR("listener-a", "0.0.0.0", 80))
+	st.SetListener(makeListenerCR("listener-b", "10.0.0.1", 80))
 	// a VirtualService on listener-a so the listener address check actually sees both
 	st.SetVirtualService(makeVSWithListener("vs-a", []string{"nodeA"}, "listener-a"))
 	// listener-a already serves the domain on this node
@@ -258,8 +260,8 @@ func TestLightValidator_ListenerDuplicateDetected(t *testing.T) {
 	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
 	st := store.New()
 	// Two listeners with the same host:port
-	st.SetListener(makeListenerCR("ns", "l1", "127.0.0.1", 9090))
-	st.SetListener(makeListenerCR("ns", "l2", "127.0.0.1", 9090))
+	st.SetListener(makeListenerCR("l1", "127.0.0.1", 9090))
+	st.SetListener(makeListenerCR("l2", "127.0.0.1", 9090))
 
 	// Create VirtualServices that use these listeners for the SAME nodeID
 	// This should trigger a duplicate detection within the nodeID
