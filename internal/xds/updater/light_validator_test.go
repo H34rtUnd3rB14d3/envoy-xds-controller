@@ -9,6 +9,7 @@ import (
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/kaasops/envoy-xds-controller/api/v1alpha1"
+	"github.com/kaasops/envoy-xds-controller/internal/helpers"
 	"github.com/kaasops/envoy-xds-controller/internal/protoutil"
 	"github.com/kaasops/envoy-xds-controller/internal/store"
 	wrapped "github.com/kaasops/envoy-xds-controller/internal/xds/cache"
@@ -16,6 +17,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
+
+// Domains are unique per listener, so tests that seed the domain index have to use the
+// same composite key the validator builds.
+var (
+	testListenerA = helpers.NamespacedName{Namespace: "ns", Name: "listener-a"}
+	testListenerB = helpers.NamespacedName{Namespace: "ns", Name: "listener-b"}
+)
+
+func ldk(listener helpers.NamespacedName, domain string) string {
+	return listenerDomain(listener, domain)
+}
 
 // helper to create minimal VS with ns/name and nodeIDs via annotation
 func makeVS(name string, nodeIDs []string) *v1alpha1.VirtualService {
@@ -116,18 +128,104 @@ func TestLightValidator_DuplicateWithinVS(t *testing.T) {
 func TestLightValidator_DomainCollisionAcrossNodes(t *testing.T) {
 	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
 	st := store.New()
-	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"nodeA": {"b.com": {}}})
+	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"nodeA": {ldk(testListenerA, "b.com"): {}}})
 	cu := NewCacheUpdater(wrapped.NewSnapshotCache(), st)
 
 	restore := withStubbedBuilder(t, func(_ *v1alpha1.VirtualService, _ store.Store) (*resbuilder.Resources, error) {
-		return &resbuilder.Resources{Domains: []string{"b.com"}}, nil
+		return &resbuilder.Resources{Domains: []string{"b.com"}, Listener: testListenerA}, nil
 	})
 	defer restore()
 
 	vs := makeVS("vs1", []string{"nodeA"})
 	err := cu.DryValidateVirtualServiceLight(context.Background(), vs, nil, true)
-	if err == nil || err.Error() != "duplicate domain 'b.com' for node nodeA" {
+	if err == nil || err.Error() != "duplicate domain 'b.com' for node nodeA on listener ns/listener-a" {
 		t.Fatalf("expected duplicate domain across nodes error, got %v", err)
+	}
+}
+
+// TestLightValidator_SameDomainDifferentListener is the regression test for the
+// false positive: the same domain on two different listeners must be allowed.
+func TestLightValidator_SameDomainDifferentListener(t *testing.T) {
+	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
+	st := store.New()
+	// listener-a already serves b.com on this node
+	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"nodeA": {ldk(testListenerA, "b.com"): {}}})
+	cu := NewCacheUpdater(wrapped.NewSnapshotCache(), st)
+
+	// the candidate serves the same domain, but on listener-b
+	restore := withStubbedBuilder(t, func(_ *v1alpha1.VirtualService, _ store.Store) (*resbuilder.Resources, error) {
+		return &resbuilder.Resources{Domains: []string{"b.com"}, Listener: testListenerB}, nil
+	})
+	defer restore()
+
+	vs := makeVS("vs1", []string{"nodeA"})
+	if err := cu.DryValidateVirtualServiceLight(context.Background(), vs, nil, true); err != nil {
+		t.Fatalf("same domain on a different listener must be allowed, got %v", err)
+	}
+}
+
+// TestLightValidator_SameDomainListenersSharingPort covers the requirement that two
+// listeners stay independent even when they share a port and only differ by address.
+// It also exercises the listener address check, which keys on host:port and therefore
+// has to accept both listeners in the first place.
+func TestLightValidator_SameDomainListenersSharingPort(t *testing.T) {
+	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
+	st := store.New()
+	st.SetListener(makeListenerCR("ns", "listener-a", "0.0.0.0", 80))
+	st.SetListener(makeListenerCR("ns", "listener-b", "10.0.0.1", 80))
+	// a VirtualService on listener-a so the listener address check actually sees both
+	st.SetVirtualService(makeVSWithListener("vs-a", []string{"nodeA"}, "listener-a"))
+	// listener-a already serves the domain on this node
+	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"nodeA": {ldk(testListenerA, "b.com"): {}}})
+	cu := NewCacheUpdater(wrapped.NewSnapshotCache(), st)
+
+	restore := withStubbedBuilder(t, func(_ *v1alpha1.VirtualService, _ store.Store) (*resbuilder.Resources, error) {
+		return &resbuilder.Resources{Domains: []string{"b.com"}, Listener: testListenerB}, nil
+	})
+	defer restore()
+
+	vs := makeVSWithListener("vs1", []string{"nodeA"}, "listener-b")
+	if err := cu.DryValidateVirtualServiceLight(context.Background(), vs, nil, true); err != nil {
+		t.Fatalf("listeners sharing a port must stay independent, got %v", err)
+	}
+}
+
+// TestLightValidator_WildcardDifferentListener covers the same case for '*', which is
+// the catch-all domain and therefore the one most likely to be reused across listeners.
+func TestLightValidator_WildcardDifferentListener(t *testing.T) {
+	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
+	st := store.New()
+	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"nodeA": {ldk(testListenerA, "*"): {}}})
+	cu := NewCacheUpdater(wrapped.NewSnapshotCache(), st)
+
+	restore := withStubbedBuilder(t, func(_ *v1alpha1.VirtualService, _ store.Store) (*resbuilder.Resources, error) {
+		return &resbuilder.Resources{Domains: []string{"*"}, Listener: testListenerB}, nil
+	})
+	defer restore()
+
+	vs := makeVS("vs1", []string{"nodeA"})
+	if err := cu.DryValidateVirtualServiceLight(context.Background(), vs, nil, true); err != nil {
+		t.Fatalf("'*' on a different listener must be allowed, got %v", err)
+	}
+}
+
+// TestLightValidator_WildcardSameListener makes sure relaxing the scope did not
+// disable the check that actually matters.
+func TestLightValidator_WildcardSameListener(t *testing.T) {
+	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
+	st := store.New()
+	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"nodeA": {ldk(testListenerA, "*"): {}}})
+	cu := NewCacheUpdater(wrapped.NewSnapshotCache(), st)
+
+	restore := withStubbedBuilder(t, func(_ *v1alpha1.VirtualService, _ store.Store) (*resbuilder.Resources, error) {
+		return &resbuilder.Resources{Domains: []string{"*"}, Listener: testListenerA}, nil
+	})
+	defer restore()
+
+	vs := makeVS("vs1", []string{"nodeA"})
+	err := cu.DryValidateVirtualServiceLight(context.Background(), vs, nil, true)
+	if err == nil || err.Error() != "duplicate domain '*' for node nodeA on listener ns/listener-a" {
+		t.Fatalf("expected duplicate '*' on the same listener, got %v", err)
 	}
 }
 
@@ -252,19 +350,19 @@ func TestLightValidator_CommonVS_NoCollision_OK(t *testing.T) {
 func TestLightValidator_CommonVS_DomainCollisionDetected(t *testing.T) {
 	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
 	st := store.New()
-	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"n1": {}, "n2": {"a.com": {}}})
+	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"n1": {}, "n2": {ldk(testListenerA, "a.com"): {}}})
 	cu := NewCacheUpdater(wrapped.NewSnapshotCache(), st)
 	_ = cu.snapshotCache.SetSnapshot(context.Background(), "n1", &cachev3.Snapshot{})
 	_ = cu.snapshotCache.SetSnapshot(context.Background(), "n2", &cachev3.Snapshot{})
 
 	restore := withStubbedBuilder(t, func(_ *v1alpha1.VirtualService, _ store.Store) (*resbuilder.Resources, error) {
-		return &resbuilder.Resources{Domains: []string{"a.com"}}, nil
+		return &resbuilder.Resources{Domains: []string{"a.com"}, Listener: testListenerA}, nil
 	})
 	defer restore()
 
 	vs := makeVS("vs-common", []string{"*"})
 	err := cu.DryValidateVirtualServiceLight(context.Background(), vs, nil, true)
-	if err == nil || err.Error() != "duplicate domain 'a.com' for node n2" {
+	if err == nil || err.Error() != "duplicate domain 'a.com' for node n2 on listener ns/listener-a" {
 		t.Fatalf("expected collision on n2 for 'a.com', got %v", err)
 	}
 }
@@ -273,18 +371,21 @@ func TestLightValidator_MultiNode_UpdatePrevExclusionPerNode(t *testing.T) {
 	t.Setenv("WEBHOOK_VALIDATION_INDICES", "1")
 	st := store.New()
 	// Both nodes have x.com currently
-	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{"n1": {"x.com": {}}, "n2": {"x.com": {}}})
+	st.ReplaceNodeDomainsIndex(map[string]map[string]struct{}{
+		"n1": {ldk(testListenerA, "x.com"): {}},
+		"n2": {ldk(testListenerA, "x.com"): {}},
+	})
 	cu := NewCacheUpdater(wrapped.NewSnapshotCache(), st)
 
 	restore := withStubbedBuilder(t, func(_ *v1alpha1.VirtualService, _ store.Store) (*resbuilder.Resources, error) {
-		return &resbuilder.Resources{Domains: []string{"x.com"}}, nil
+		return &resbuilder.Resources{Domains: []string{"x.com"}, Listener: testListenerA}, nil
 	})
 	defer restore()
 
 	prev := makeVS("prev", []string{"n1"}) // prevVS affected only n1
 	vs := makeVS("new", []string{"n1", "n2"})
 	err := cu.DryValidateVirtualServiceLight(context.Background(), vs, prev, true)
-	if err == nil || err.Error() != "duplicate domain 'x.com' for node n2" {
+	if err == nil || err.Error() != "duplicate domain 'x.com' for node n2 on listener ns/listener-a" {
 		t.Fatalf("expected duplicate only on n2 (no exclusion there), got %v", err)
 	}
 }
